@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cct — Cyrus' tmux TUI: a small full-screen TUI to launch a coding agent
-# (claude/codex) in a named tmux session, or attach to / delete sessions.
+# (claude/codex/pi/opencode) in a named tmux session, or attach to / delete
+# sessions.
 #
 # Everything is arrow-driven: ↑/↓ (or k/j) move, →/Enter act, ←/Esc back.
 set -euo pipefail
@@ -247,10 +248,12 @@ screen_new() {
   local -a cmd
 
   # Provider
-  tui_select "cct ❯ new session" "Pick a provider" "claude" "codex" || return 1
+  tui_select "cct ❯ new session" "Pick a provider" "claude" "codex" "pi" "opencode" || return 1
   case "$SELECT_IDX" in
     0) provider=claude ;;
     1) provider=codex ;;
+    2) provider=pi ;;
+    3) provider=opencode ;;
   esac
   command -v "$provider" >/dev/null || { tui_select "$provider not found in PATH" "" "OK"; return 1; }
 
@@ -283,10 +286,14 @@ screen_new() {
     esac
   fi
 
-  # Agent command (auto mode — auto-approve in-workspace edits, prompt for risk)
+  # Agent command (auto mode — auto-approve in-workspace edits, prompt for risk).
+  # pi has no permission popups and opencode is config-driven (no auto-approve
+  # flag), so both just launch the bare binary.
   case "$provider" in
-    claude) cmd=(claude --permission-mode auto) ;;
-    codex)  cmd=(codex  --sandbox workspace-write --ask-for-approval on-request) ;;
+    claude)   cmd=(claude --permission-mode auto) ;;
+    codex)    cmd=(codex  --sandbox workspace-write --ask-for-approval on-request) ;;
+    pi)       cmd=(pi) ;;
+    opencode) cmd=(opencode) ;;
   esac
 
   # Launch detached, then attach. set-titles publishes the OSC 2 title so

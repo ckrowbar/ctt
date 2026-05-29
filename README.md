@@ -28,8 +28,9 @@ It's a single Bash script. No runtime beyond tmux and a coding-agent CLI.
 - **Guided new-session flow** — pick a provider, choose a working directory,
   then name the session. The default name is built from the model, the folder,
   and the date/time (e.g. `claude-web-ui-0529-1430`) and is fully editable.
-- **Directory picker** — browse the filesystem with arrows; symlinked
-  directories are enterable and marked with `→`.
+- **Directory picker** — browse the filesystem with arrows; just start typing
+  to filter the current directory (case-insensitive). Symlinked directories are
+  enterable and marked with `→`.
 - **Conflict & delete handling** — attach / kill+recreate when a name exists;
   confirm before deleting a session.
 - **Clean terminal handling** — restores cursor and terminal state on quit,
@@ -90,7 +91,7 @@ Updating a system-wide install may need elevated permissions: `sudo cct --update
 | Session list     | `↑/↓` `k/j` move · `⏎`/`→` open · `n` new · `d` delete · `r` refresh · `q` quit |
 | Provider / menus | `↑/↓` move · `⏎` select · `Esc` cancel                        |
 | Name input       | type to edit · `⏎` accept · `⌫` delete · `^U` clear · `Esc` cancel |
-| Directory picker | `↑/↓` move · `→`/`⏎` open · `←` parent · `~` home · `q` cancel |
+| Directory picker | `↑/↓` move · `→`/`⏎` open · `←` parent · type to filter · `⌫` del filter · `Esc` clear/cancel |
 
 `Ctrl-C` exits cleanly from any screen.
 
