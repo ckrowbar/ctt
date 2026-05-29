@@ -62,6 +62,26 @@ Then just run:
 cct
 ```
 
+## Updating
+
+```sh
+cct --update
+```
+
+This replaces the installed script in place with the latest version from
+`main`, after validating the download. It works wherever `cct` lives on your
+`PATH` (no need to remember the install path), and it preserves a symlinked
+install by writing through the link.
+
+If you installed via `git clone`, `cct --update` detects the checkout and points
+you at the right command instead:
+
+```sh
+git -C /path/to/cct pull
+```
+
+Updating a system-wide install may need elevated permissions: `sudo cct --update`.
+
 ## Keybindings
 
 | Screen           | Keys                                                          |

@@ -5,6 +5,10 @@
 # Everything is arrow-driven: ↑/↓ (or k/j) move, →/Enter act, ←/Esc back.
 set -euo pipefail
 
+VERSION="0.1.0"
+# Canonical location of the script, used by `cct --update`.
+SELF_URL="https://raw.githubusercontent.com/ckrowbar/cct/main/cct"
+
 # ---------------------------------------------------------------------------
 # Colors — only when stderr is a TTY (so piping/redirecting stays clean).
 # ---------------------------------------------------------------------------
@@ -357,6 +361,55 @@ screen_main() {
     esac
   done
 }
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint: handle flags before entering the TUI.
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+cct $VERSION — Cyrus' tmux TUI
+
+Usage:
+  cct              launch the interactive TUI
+  cct -u|--update  update cct in place to the latest version
+  cct -v|--version print version
+  cct -h|--help    show this help
+EOF
+}
+
+# Replace the installed script with the latest version from SELF_URL. For a git
+# checkout it just points you at `git pull` (overwriting would dirty the tree).
+cct_update() {
+  command -v curl >/dev/null || die "curl is required to update"
+  local target dir tmp
+  target="$(realpath "${BASH_SOURCE[0]}")"
+  dir="$(dirname "$target")"
+  if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     && git -C "$dir" ls-files --error-unmatch "$target" >/dev/null 2>&1; then
+    printf 'cct is a git checkout — update with:\n  git -C %s pull\n' "$dir"
+    return 0
+  fi
+  [[ -w "$target" ]] || die "no write permission for $target (try: sudo cct --update)"
+  tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+  curl -fsSL "$SELF_URL" -o "$tmp"          || die "download failed"
+  head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' || die "downloaded file is not cct"
+  bash -n "$tmp"                            || die "downloaded script failed its syntax check; not installing"
+  local newver
+  newver="$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -n1)"
+  cat "$tmp" > "$target"                    || die "failed to write $target"
+  chmod +x "$target"
+  printf 'updated %s → %s (was %s)\n' "$target" "${newver:-?}" "$VERSION"
+}
+
+case "${1:-}" in
+  -h|--help)        usage; exit 0 ;;
+  -v|--version)     printf 'cct %s\n' "$VERSION"; exit 0 ;;
+  -u|--update|update) cct_update; exit $? ;;
+  "")               : ;;
+  *)                die "unknown argument: $1 (try: cct --help)" ;;
+esac
 
 tui_init
 screen_main
