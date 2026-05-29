@@ -303,13 +303,16 @@ screen_new() {
   # charset; "/" becomes "root".
   local folder="${workdir##*/}"
   [[ -z "$folder" ]] && folder=root
-  folder="${folder//[^A-Za-z0-9._-]/-}"
+  # tmux mangles '.' in session names (stores it as '_') and parses '.'/':' in a
+  # target as session.window.pane, so a dotted name creates fine but can't be
+  # attached. Keep only chars tmux treats literally in both a name and a target.
+  folder="${folder//[^A-Za-z0-9_-]/-}"
   local default_name; default_name="${provider}-${folder}-$(date +%m%d-%H%M)"
   while true; do
     tui_input "cct ❯ new session" "Session name" "$default_name" || return 1
     session="${INPUT_VALUE:-$default_name}"
-    [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] && break
-    tui_select "Invalid name: $session" "Allowed: letters, digits, . _ -" "Try again" || return 1
+    [[ "$session" =~ ^[A-Za-z0-9_-]+$ ]] && break
+    tui_select "Invalid name: $session" "Allowed: letters, digits, _ -" "Try again" || return 1
   done
 
   # Conflict
