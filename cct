@@ -174,8 +174,10 @@ tui_input() {
 
 # ---------------------------------------------------------------------------
 # Directory picker — walks the tree from $1 (default $PWD), sets `picked_dir`.
-#   ↑/↓ (k/j) move · →/⏎ (l) open dir / choose on top row · ← (h/⌫) parent
-#   ~ home · g root · q/esc cancel
+#   ↑/↓ move · →/⏎ open dir (or choose on the top row) · ← parent
+#   type to filter the current directory (case-insensitive substring);
+#   ⌫ deletes a filter char (or goes to the parent when the filter is empty);
+#   esc clears the filter, or cancels when it's already empty.
 # Returns non-zero on cancel.
 # ---------------------------------------------------------------------------
 list_entries() {  # emit "<type><TAB>name" sorted: dir-likes first, then the rest.
@@ -190,18 +192,29 @@ list_entries() {  # emit "<type><TAB>name" sorted: dir-likes first, then the res
 
 picked_dir=""
 pick_dir() {
-  local cur="${1:-$PWD}" sel=0
+  local cur="${1:-$PWD}" sel=0 filter="" jump=0
   cur="$(cd "$cur" 2>/dev/null && pwd)" || cur="$PWD"
   local -a names types
   while true; do
+    # Pinned action rows, then entries (filtered by a case-insensitive substring
+    # match when a filter is active). `pinned` = how many rows precede entries.
     names=("✓ use this directory"); types=("use")
     if [[ "$cur" != "/" ]]; then names+=(".."); types+=("up"); fi
-    local t n
+    local pinned=${#names[@]} t n
     while IFS=$'\t' read -r t n; do
       [[ -z "$t" ]] && continue
+      if [[ -n "$filter" ]]; then
+        local ln="${n,,}" lf="${filter,,}"
+        [[ "$ln" == *"$lf"* ]] || continue
+      fi
       names+=("$n"); types+=("$t")
     done < <(list_entries "$cur")
 
+    # After a filter change, jump the highlight to the first matching entry.
+    if (( jump )); then
+      (( ${#names[@]} > pinned )) && sel=$pinned || sel=$(( ${#names[@]} - 1 ))
+      jump=0
+    fi
     (( sel < 0 )) && sel=0
     (( sel >= ${#names[@]} )) && sel=$(( ${#names[@]} - 1 ))
 
@@ -217,24 +230,35 @@ pick_dir() {
         *)   FRAME_ROWS+=("${names[$i]}");  FRAME_STYLES+=("$DIM") ;;
       esac
     done
-    draw "cct ❯ pick a directory" "$cur" \
-         "↑/↓ move · →/⏎ open · ← parent · ~ home · q quit" "$sel"
+
+    local sub="$cur"
+    if [[ -n "$filter" ]]; then
+      sub+="    🔎 ${filter}"
+      (( ${#names[@]} == pinned )) && sub+="  (no matches)"
+    fi
+    draw "cct ❯ pick a directory" "$sub" \
+         "↑/↓ move · →/⏎ open · ← parent · type to filter · ⌫ del · esc clear/cancel" "$sel"
 
     read_key
     case "$REPLY" in
-      up|k)                  sel=$(( sel - 1 )) ;;
-      down|j)                sel=$(( sel + 1 )) ;;
-      left|h|backspace)      [[ "$cur" != "/" ]] && { cur="$(cd "$cur/.." && pwd)"; sel=0; } ;;
-      right|l|enter)
+      up)    sel=$(( sel - 1 )) ;;
+      down)  sel=$(( sel + 1 )) ;;
+      left)  [[ "$cur" != "/" ]] && { cur="$(cd "$cur/.." && pwd)"; sel=0; filter=""; } ;;
+      right|enter)
         case "${types[$sel]}" in
           use)  picked_dir="$cur"; return 0 ;;
-          up)   cur="$(cd "$cur/.." && pwd)"; sel=0 ;;
-          d|l)  cur="$(cd "$cur/${names[$sel]}" && pwd)"; sel=0 ;;
+          up)   cur="$(cd "$cur/.." && pwd)"; sel=0; filter="" ;;
+          d|l)  cur="$(cd "$cur/${names[$sel]}" && pwd)"; sel=0; filter="" ;;
         esac
         ;;
-      '~')                   cur="$HOME"; sel=0 ;;
-      g)                     cur="/"; sel=0 ;;
-      q|esc)                 return 1 ;;
+      backspace)
+        if [[ -n "$filter" ]]; then filter="${filter%?}"; jump=1
+        elif [[ "$cur" != "/" ]]; then cur="$(cd "$cur/.." && pwd)"; sel=0; fi
+        ;;
+      esc)   if [[ -n "$filter" ]]; then filter=""; jump=1; else return 1; fi ;;
+      *)     # any printable character starts/extends the filter
+        [[ ${#REPLY} -eq 1 && "$REPLY" == [[:print:]] ]] && { filter+="$REPLY"; jump=1; }
+        ;;
     esac
   done
 }
