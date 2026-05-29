@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# cct — Cyrus' tmux TUI: a small full-screen TUI to launch a coding agent
+# (claude/codex) in a named tmux session, or attach to / delete sessions.
+#
+# Everything is arrow-driven: ↑/↓ (or k/j) move, →/Enter act, ←/Esc back.
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Colors — only when stderr is a TTY (so piping/redirecting stays clean).
+# ---------------------------------------------------------------------------
+if [[ -t 2 ]]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+  RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'
+  BLUE=$'\e[34m'; CYAN=$'\e[36m'
+else
+  BOLD=''; DIM=''; RESET=''
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''
+fi
+
+die() { printf '%scct:%s %s\n' "$RED$BOLD" "$RESET" "$1" >&2; exit 1; }
+
+command -v tmux >/dev/null || die "tmux not installed"
+
+# Render an elapsed time as a short relative string ("3m ago", "2h ago").
+reltime() {  # <now-epoch> <then-epoch>
+  local now="$1" then="${2:-}" d
+  [[ "$then" =~ ^[0-9]+$ ]] || { printf ''; return; }
+  d=$(( now - then )); (( d < 0 )) && d=0
+  if   (( d < 60 ));    then printf 'just now'
+  elif (( d < 3600 ));  then printf '%dm ago' "$(( d / 60 ))"
+  elif (( d < 86400 )); then printf '%dh ago' "$(( d / 3600 ))"
+  else                       printf '%dd ago' "$(( d / 86400 ))"
+  fi
+}
+
+# ===========================================================================
+# Shared TUI primitives. One raw-mode session on fd 3 (/dev/tty) for the whole
+# app; tui_cleanup always restores it (via EXIT/INT/TERM trap, and explicitly
+# before any `exec tmux …` since exec skips the EXIT trap).
+# ===========================================================================
+TTY=/dev/tty
+STTY_SAVED=""
+
+tui_init() {
+  exec 3<>"$TTY" || die "no controlling terminal (cct needs an interactive TTY)"
+  STTY_SAVED="$(stty -g <&3)"
+  stty -echo -icanon <&3
+  printf '\e[?25l\e[2J' >&3            # hide cursor, clear
+  # EXIT restores the terminal on any exit; INT/TERM must *also* exit — a plain
+  # cleanup-only signal trap lets bash resume the interrupted read loop, which
+  # leaves the app stuck. exit 130 = 128 + SIGINT, the conventional code.
+  trap 'tui_cleanup' EXIT
+  trap 'tui_cleanup; exit 130' INT TERM
+}
+
+tui_cleanup() {
+  [[ -n "$STTY_SAVED" ]] && stty "$STTY_SAVED" <&3 2>/dev/null || true
+  printf '\e[?25h\e[2J\e[H' >&3 2>/dev/null || true   # show cursor, clear
+  exec 3>&- 3<&- 2>/dev/null || true
+  STTY_SAVED=""
+}
+
+# Read one key into REPLY, normalizing special keys to friendly names.
+# Printable keys come through as their literal character.
+read_key() {
+  local k rest
+  IFS= read -rsn1 k <&3 || { REPLY=esc; return; }
+  if [[ $k == $'\e' ]]; then
+    read -rsn2 -t 0.01 rest <&3 || true
+    k+=$rest
+  fi
+  case "$k" in
+    $'\e[A')          REPLY=up ;;
+    $'\e[B')          REPLY=down ;;
+    $'\e[C')          REPLY=right ;;
+    $'\e[D')          REPLY=left ;;
+    $'\r'|$'\n'|'')   REPLY=enter ;;
+    $'\x7f'|$'\x08')  REPLY=backspace ;;
+    $'\x15')          REPLY=ctrl-u ;;
+    $'\e')            REPLY=esc ;;
+    *)                REPLY=$k ;;
+  esac
+}
+
+# Full-screen frame. Caller fills the FRAME_ROWS array (plain text) and the
+# parallel FRAME_STYLES array (color applied when a row is NOT selected); the
+# selected row is drawn as a reverse-video bar. Scrolls a viewport so long
+# lists stay usable.
+#   draw <title> <subtitle> <footer> <sel>
+FRAME_ROWS=()
+FRAME_STYLES=()
+draw() {
+  local title="$1" subtitle="$2" footer="$3" sel="$4"
+  local rows total head=3 foot=2 maxv start=0 end i
+  rows="$(stty size <&3 | { read -r r _; echo "${r:-24}"; })"
+  total=${#FRAME_ROWS[@]}
+  maxv=$(( rows - head - foot )); (( maxv < 3 )) && maxv=3
+  if (( total > maxv )); then
+    start=$(( sel - maxv / 2 ))
+    (( start < 0 )) && start=0
+    (( start > total - maxv )) && start=$(( total - maxv ))
+  fi
+  end=$(( start + maxv )); (( end > total )) && end=$total
+
+  printf '\e[2J\e[H' >&3
+  printf '%s  %s%s\n' "$BLUE$BOLD" "$title" "$RESET" >&3
+  [[ -n "$subtitle" ]] && printf '%s  %s%s\n' "$DIM" "$subtitle" "$RESET" >&3
+  printf '\n' >&3
+  for (( i = start; i < end; i++ )); do
+    if (( i == sel )); then
+      printf '  \e[7m %s \e[0m\n' "${FRAME_ROWS[$i]}" >&3
+    else
+      printf '   %s%s%s\n' "${FRAME_STYLES[$i]}" "${FRAME_ROWS[$i]}" "$RESET" >&3
+    fi
+  done
+  (( total > maxv )) && printf '%s  … %d/%d%s\n' "$DIM" "$((sel + 1))" "$total" "$RESET" >&3
+  printf '\n%s  %s%s' "$DIM" "$footer" "$RESET" >&3
+}
+
+# Generic single-choice list. Args: <title> <subtitle> <option>...
+# Sets SELECT_IDX to the chosen 0-based option index; returns 1 on cancel.
+SELECT_IDX=0
+tui_select() {
+  local title="$1" subtitle="$2"; shift 2
+  local opts=("$@") sel=0 n=${#opts[@]}
+  while true; do
+    FRAME_ROWS=("${opts[@]}")
+    FRAME_STYLES=(); local _i; for _i in "${!opts[@]}"; do FRAME_STYLES+=(""); done
+    draw "$title" "$subtitle" "↑/↓ move · ⏎ select · esc cancel" "$sel"
+    read_key
+    case "$REPLY" in
+      up|k)              sel=$(( (sel - 1 + n) % n )) ;;
+      down|j)            sel=$(( (sel + 1) % n )) ;;
+      enter|right|l)     SELECT_IDX=$sel; return 0 ;;
+      esc|q|left|h)      return 1 ;;
+    esac
+  done
+}
+
+# Yes/no confirm. Args: <title> <subtitle>. Returns 0 for yes, 1 for no/cancel.
+tui_confirm() {
+  tui_select "$1" "$2" "Yes" "No" || return 1
+  (( SELECT_IDX == 0 ))
+}
+
+# Single-line text input with basic editing. Args: <title> <subtitle> <default>
+# Sets INPUT_VALUE; returns 1 on cancel (Esc).
+INPUT_VALUE=""
+tui_input() {
+  local title="$1" subtitle="$2" buf="${3:-}"
+  while true; do
+    printf '\e[2J\e[H' >&3
+    printf '%s  %s%s\n' "$BLUE$BOLD" "$title" "$RESET" >&3
+    [[ -n "$subtitle" ]] && printf '%s  %s%s\n' "$DIM" "$subtitle" "$RESET" >&3
+    printf '\n  %s❯%s %s%s \e[7m \e[0m\n' "$CYAN" "$RESET" "$BOLD" "$buf" >&3
+    printf '%s' "$RESET" >&3
+    printf '\n%s  type to edit · ⏎ accept · ⌫ delete · ^U clear · esc cancel%s' "$DIM" "$RESET" >&3
+    read_key
+    case "$REPLY" in
+      enter)      INPUT_VALUE="$buf"; return 0 ;;
+      esc)        return 1 ;;
+      backspace)  buf="${buf%?}" ;;
+      ctrl-u)     buf="" ;;
+      up|down|left|right) : ;;        # ignore navigation in a text field
+      *)          [[ ${#REPLY} -eq 1 ]] && buf+="$REPLY" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Directory picker — walks the tree from $1 (default $PWD), sets `picked_dir`.
+#   ↑/↓ (k/j) move · →/⏎ (l) open dir / choose on top row · ← (h/⌫) parent
+#   ~ home · g root · q/esc cancel
+# Returns non-zero on cancel.
+# ---------------------------------------------------------------------------
+list_entries() {  # emit "<type><TAB>name" sorted: dir-likes first, then the rest.
+  # -xtype d matches real dirs AND symlinks that resolve to a directory; %y is
+  # the entry's own type ('d' real dir, 'l' symlink) so the picker can mark and
+  # still enter symlinked directories. Everything else is reported as 'f'.
+  (cd "$1" 2>/dev/null && {
+     find . -maxdepth 1 -mindepth 1 -xtype d  ! -name '.*' -printf '%y\t%f\n' 2>/dev/null | LC_ALL=C sort -t$'\t' -k2
+     find . -maxdepth 1 -mindepth 1 ! -xtype d ! -name '.*' -printf 'f\t%f\n'  2>/dev/null | LC_ALL=C sort -t$'\t' -k2
+   }) || true
+}
+
+picked_dir=""
+pick_dir() {
+  local cur="${1:-$PWD}" sel=0
+  cur="$(cd "$cur" 2>/dev/null && pwd)" || cur="$PWD"
+  local -a names types
+  while true; do
+    names=("✓ use this directory"); types=("use")
+    if [[ "$cur" != "/" ]]; then names+=(".."); types+=("up"); fi
+    local t n
+    while IFS=$'\t' read -r t n; do
+      [[ -z "$t" ]] && continue
+      names+=("$n"); types+=("$t")
+    done < <(list_entries "$cur")
+
+    (( sel < 0 )) && sel=0
+    (( sel >= ${#names[@]} )) && sel=$(( ${#names[@]} - 1 ))
+
+    # Build display rows + styles parallel to names/types.
+    FRAME_ROWS=(); FRAME_STYLES=()
+    local i
+    for i in "${!names[@]}"; do
+      case "${types[$i]}" in
+        use) FRAME_ROWS+=("${names[$i]}");  FRAME_STYLES+=("$GREEN") ;;
+        up)  FRAME_ROWS+=("..");            FRAME_STYLES+=("$CYAN") ;;
+        d)   FRAME_ROWS+=("${names[$i]}/"); FRAME_STYLES+=("$BLUE$BOLD") ;;
+        l)   FRAME_ROWS+=("${names[$i]}/ →"); FRAME_STYLES+=("$CYAN$BOLD") ;;
+        *)   FRAME_ROWS+=("${names[$i]}");  FRAME_STYLES+=("$DIM") ;;
+      esac
+    done
+    draw "cct ❯ pick a directory" "$cur" \
+         "↑/↓ move · →/⏎ open · ← parent · ~ home · q quit" "$sel"
+
+    read_key
+    case "$REPLY" in
+      up|k)                  sel=$(( sel - 1 )) ;;
+      down|j)                sel=$(( sel + 1 )) ;;
+      left|h|backspace)      [[ "$cur" != "/" ]] && { cur="$(cd "$cur/.." && pwd)"; sel=0; } ;;
+      right|l|enter)
+        case "${types[$sel]}" in
+          use)  picked_dir="$cur"; return 0 ;;
+          up)   cur="$(cd "$cur/.." && pwd)"; sel=0 ;;
+          d|l)  cur="$(cd "$cur/${names[$sel]}" && pwd)"; sel=0 ;;
+        esac
+        ;;
+      '~')                   cur="$HOME"; sel=0 ;;
+      g)                     cur="/"; sel=0 ;;
+      q|esc)                 return 1 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# New-session flow: provider → name → conflict → directory → launch + attach.
+# Returns to the caller (main screen) if the user cancels at any step.
+# ---------------------------------------------------------------------------
+screen_new() {
+  local provider session workdir
+  local -a cmd
+
+  # Provider
+  tui_select "cct ❯ new session" "Pick a provider" "claude" "codex" || return 1
+  case "$SELECT_IDX" in
+    0) provider=claude ;;
+    1) provider=codex ;;
+  esac
+  command -v "$provider" >/dev/null || { tui_select "$provider not found in PATH" "" "OK"; return 1; }
+
+  # Session name (editable, with validation)
+  local default_name="${provider}-$(date +%H%M)"
+  while true; do
+    tui_input "cct ❯ new session" "Session name" "$default_name" || return 1
+    session="${INPUT_VALUE:-$default_name}"
+    [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] && break
+    tui_select "Invalid name: $session" "Allowed: letters, digits, . _ -" "Try again" || return 1
+  done
+
+  # Conflict
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tui_select "Session '$session' already exists" "What now?" \
+      "Attach to it" "Kill and recreate" "Cancel" || return 1
+    case "$SELECT_IDX" in
+      0) tui_cleanup; exec tmux attach -t "$session" ;;
+      1) tmux kill-session -t "$session" 2>/dev/null || true ;;
+      2) return 1 ;;
+    esac
+  fi
+
+  # Working directory
+  pick_dir "$PWD" || return 1
+  workdir="$picked_dir"
+
+  # Agent command (auto mode — auto-approve in-workspace edits, prompt for risk)
+  case "$provider" in
+    claude) cmd=(claude --permission-mode auto) ;;
+    codex)  cmd=(codex  --sandbox workspace-write --ask-for-approval on-request) ;;
+  esac
+
+  # Launch detached, then attach. set-titles publishes the OSC 2 title so
+  # Zed's "Terminal Threads" sidebar shows the session name. Scrolling / mouse /
+  # history-limit live in ~/.tmux.conf.
+  tmux new-session -d -s "$session" -c "$workdir" "${cmd[@]}"
+  tmux set-option -t "$session" set-titles on
+  tmux set-option -t "$session" set-titles-string "$session"
+  tui_cleanup
+  exec tmux attach -t "$session"
+}
+
+# ---------------------------------------------------------------------------
+# Main screen: a live list of sessions plus a pinned "New session" row.
+#   ↑/↓ (k/j) move · →/⏎ attach (or create) · n new · d delete · r refresh · q quit
+# ---------------------------------------------------------------------------
+screen_main() {
+  local sel=0
+  local -a snames sinfo
+  while true; do
+    # Gather sessions: name, last-activity epoch, attached?, path. Joined by an
+    # ASCII Unit Separator (\x1f) — a non-whitespace delimiter, so `read` keeps
+    # empty fields (a non-attached session has an empty "attached" column).
+    snames=(); sinfo=()
+    local name act att path now meta us=$'\x1f' tilde='~'
+    now="$(date +%s)"
+    while IFS="$us" read -r name act att path; do
+      [[ -z "$name" ]] && continue
+      snames+=("$name")
+      if [[ -n "$att" ]]; then meta="$att"; else meta="$(reltime "$now" "$act")"; fi
+      # $tilde (quoted) keeps a literal ~; a bare ~ gets tilde-expanded to $HOME.
+      [[ -n "$path" ]] && meta+="  ${path/#$HOME/$tilde}"
+      sinfo+=("$meta")
+    done < <(tmux ls -F "#{session_name}${us}#{session_activity}${us}#{?session_attached,attached,}${us}#{pane_current_path}" 2>/dev/null || true)
+
+    # Rows: pinned "New session" first, then one row per session.
+    FRAME_ROWS=("＋  New session")
+    FRAME_STYLES=("$GREEN$BOLD")
+    local i
+    for i in "${!snames[@]}"; do
+      FRAME_ROWS+=("$(printf '%-22s %s' "${snames[$i]}" "${DIM}${sinfo[$i]}")")
+      FRAME_STYLES+=("$CYAN")
+    done
+
+    local n=${#FRAME_ROWS[@]}
+    (( sel < 0 )) && sel=0
+    (( sel >= n )) && sel=$(( n - 1 ))
+
+    local sub="${#snames[@]} session(s)"
+    (( ${#snames[@]} == 0 )) && sub="no sessions yet — create one"
+    draw "cct ❯ coding-agent sessions" "$sub" \
+         "↑/↓ move · ⏎ open · n new · d delete · r refresh · q quit" "$sel"
+
+    read_key
+    case "$REPLY" in
+      up|k)    sel=$(( sel - 1 )) ;;
+      down|j)  sel=$(( sel + 1 )) ;;
+      n|N)     screen_new || true ;;
+      r|R)     : ;;  # reloop refreshes
+      q|Q|esc) tui_cleanup; exit 0 ;;
+      right|l|enter)
+        if (( sel == 0 )); then
+          screen_new || true
+        else
+          tui_cleanup; exec tmux attach -t "${snames[$((sel - 1))]}"
+        fi
+        ;;
+      d|D|x)
+        if (( sel >= 1 )); then
+          local target="${snames[$((sel - 1))]}"
+          if tui_confirm "Delete session '$target'?" "This kills the tmux session and its agent."; then
+            tmux kill-session -t "$target" 2>/dev/null || true
+            sel=0
+          fi
+        fi
+        ;;
+    esac
+  done
+}
+
+tui_init
+screen_main
