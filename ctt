@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ctt — Cyrus' tmux TUI: a small full-screen TUI to launch a coding agent
-# (claude/codex/pi/opencode) in a named tmux session, or attach to / delete
+# ctt — Cyrus' tmux TUI: a small full-screen TUI to launch plain terminals or
+# tools (claude/codex/pi/opencode) in named tmux sessions, or attach to / delete
 # sessions.
 #
 # Everything is arrow-driven: ↑/↓ (or k/j) move, →/Enter act, ←/Esc back.
@@ -25,6 +25,68 @@ fi
 die() { printf '%sctt:%s %s\n' "$RED$BOLD" "$RESET" "$1" >&2; exit 1; }
 
 command -v tmux >/dev/null || die "tmux not installed"
+
+# ---------------------------------------------------------------------------
+# Launchers. The default is a plain tmux shell. Agent/tool launch commands can
+# be customized by defining CTT_CMD_<ID> arrays in ~/.config/ctt/config.bash
+# (or the path in $CTT_CONFIG). An empty command means "use tmux's default shell".
+# ---------------------------------------------------------------------------
+declare -a CTT_LAUNCHER_IDS=(terminal claude codex pi opencode)
+declare -A CTT_LAUNCHER_LABELS=(
+  [terminal]="terminal"
+  [claude]="claude"
+  [codex]="codex"
+  [pi]="pi"
+  [opencode]="opencode"
+)
+declare -a CTT_CMD_TERMINAL=()
+declare -a CTT_CMD_CLAUDE=(claude --permission-mode auto)
+declare -a CTT_CMD_CODEX=(codex --sandbox workspace-write --ask-for-approval on-request)
+declare -a CTT_CMD_PI=(pi)
+declare -a CTT_CMD_OPENCODE=(opencode)
+
+load_config() {
+  local config="${CTT_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ctt/config.bash}"
+  [[ -f "$config" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$config" || die "failed to load config: $config"
+}
+
+launcher_cmd_var() {  # <launcher-id>
+  local id="$1"
+  [[ "$id" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || die "invalid launcher id '$id' (use letters, digits, and _; start with a letter)"
+  printf 'CTT_CMD_%s' "${id^^}"
+}
+
+launcher_label() {  # <launcher-id>
+  local id="$1"
+  printf '%s' "${CTT_LAUNCHER_LABELS[$id]:-$id}"
+}
+
+launcher_command() {  # <launcher-id>; sets LAUNCH_CMD
+  local id="$1" var
+  var="$(launcher_cmd_var "$id")"
+  LAUNCH_CMD=()
+  if declare -p "$var" >/dev/null 2>&1; then
+    eval "LAUNCH_CMD=(\"\${${var}[@]}\")"
+  else
+    LAUNCH_CMD=("$id")
+  fi
+}
+
+validate_launchers() {
+  (( ${#CTT_LAUNCHER_IDS[@]} > 0 )) || die "no launchers configured"
+  local id var decl
+  for id in "${CTT_LAUNCHER_IDS[@]}"; do
+    var="$(launcher_cmd_var "$id")"
+    if decl="$(declare -p "$var" 2>/dev/null)" && [[ "$decl" != declare\ -*a* ]]; then
+      die "$var must be an indexed array"
+    fi
+  done
+}
+
+load_config
+validate_launchers
 
 # Render an elapsed time as a short relative string ("3m ago", "2h ago").
 reltime() {  # <now-epoch> <then-epoch>
@@ -277,37 +339,44 @@ pick_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# New-session flow: provider → name → conflict → directory → launch + attach.
+# New-session flow: launcher → name → conflict → directory → launch + attach.
 # Returns to the caller (main screen) if the user cancels at any step.
 # ---------------------------------------------------------------------------
 screen_new() {
-  local provider session workdir
-  local -a cmd
+  local launcher session workdir
+  local -a cmd launcher_opts
 
-  # Provider
-  tui_select "ctt ❯ new session" "Pick a provider" "claude" "codex" "pi" "opencode" || return 1
-  case "$SELECT_IDX" in
-    0) provider=claude ;;
-    1) provider=codex ;;
-    2) provider=pi ;;
-    3) provider=opencode ;;
-  esac
-  command -v "$provider" >/dev/null || { tui_select "$provider not found in PATH" "" "OK"; return 1; }
+  # Launcher. The first configured launcher is selected first; by default that
+  # is a plain tmux terminal.
+  launcher_opts=()
+  local id
+  for id in "${CTT_LAUNCHER_IDS[@]}"; do
+    launcher_opts+=("$(launcher_label "$id")")
+  done
+  tui_select "ctt ❯ new session" "Pick what to launch" "${launcher_opts[@]}" || return 1
+  launcher="${CTT_LAUNCHER_IDS[$SELECT_IDX]}"
+  launcher_command "$launcher"
+  cmd=("${LAUNCH_CMD[@]}")
+  if (( ${#cmd[@]} > 0 )) && ! command -v "${cmd[0]}" >/dev/null; then
+    tui_select "${cmd[0]} not found in PATH" "" "OK" || true
+    return 1
+  fi
 
   # Working directory (chosen first so its folder name can seed the default).
   pick_dir "$PWD" || return 1
   workdir="$picked_dir"
 
-  # Session name (editable, with validation). Default: model-folder-MMDD-HHMM
-  # (e.g. claude-web-ui-0529-1430). The folder name is sanitized to the allowed
-  # charset; "/" becomes "root".
+  # Session name (editable, with validation). Default: launcher-folder-MMDD-HHMM
+  # (e.g. terminal-web-ui-0529-1430). The folder name is sanitized to the
+  # allowed charset; "/" becomes "root".
   local folder="${workdir##*/}"
   [[ -z "$folder" ]] && folder=root
   # tmux mangles '.' in session names (stores it as '_') and parses '.'/':' in a
   # target as session.window.pane, so a dotted name creates fine but can't be
   # attached. Keep only chars tmux treats literally in both a name and a target.
   folder="${folder//[^A-Za-z0-9_-]/-}"
-  local default_name; default_name="${provider}-${folder}-$(date +%m%d-%H%M)"
+  local session_prefix="${launcher//[^A-Za-z0-9_-]/-}"
+  local default_name; default_name="${session_prefix}-${folder}-$(date +%m%d-%H%M)"
   while true; do
     tui_input "ctt ❯ new session" "Session name" "$default_name" || return 1
     session="${INPUT_VALUE:-$default_name}"
@@ -326,20 +395,14 @@ screen_new() {
     esac
   fi
 
-  # Agent command (auto mode — auto-approve in-workspace edits, prompt for risk).
-  # pi has no permission popups and opencode is config-driven (no auto-approve
-  # flag), so both just launch the bare binary.
-  case "$provider" in
-    claude)   cmd=(claude --permission-mode auto) ;;
-    codex)    cmd=(codex  --sandbox workspace-write --ask-for-approval on-request) ;;
-    pi)       cmd=(pi) ;;
-    opencode) cmd=(opencode) ;;
-  esac
-
   # Launch detached, then attach. set-titles publishes the OSC 2 title so
   # Zed's "Terminal Threads" sidebar shows the session name. Scrolling / mouse /
   # history-limit live in ~/.tmux.conf.
-  tmux new-session -d -s "$session" -c "$workdir" "${cmd[@]}"
+  if (( ${#cmd[@]} > 0 )); then
+    tmux new-session -d -s "$session" -c "$workdir" "${cmd[@]}"
+  else
+    tmux new-session -d -s "$session" -c "$workdir"
+  fi
   tmux set-option -t "$session" set-titles on
   tmux set-option -t "$session" set-titles-string "$session"
   tui_cleanup
@@ -384,7 +447,7 @@ screen_main() {
 
     local sub="${#snames[@]} session(s)"
     (( ${#snames[@]} == 0 )) && sub="no sessions yet — create one"
-    draw "ctt ❯ coding-agent sessions" "$sub" \
+    draw "ctt ❯ tmux sessions" "$sub" \
          "↑/↓ move · ⏎ open · n new · d delete · r refresh · q quit" "$sel"
 
     read_key
@@ -404,7 +467,7 @@ screen_main() {
       d|D|x)
         if (( sel >= 1 )); then
           local target="${snames[$((sel - 1))]}"
-          if tui_confirm "Delete session '$target'?" "This kills the tmux session and its agent."; then
+          if tui_confirm "Delete session '$target'?" "This kills the tmux session."; then
             tmux kill-session -t "$target" 2>/dev/null || true
             sel=0
           fi
